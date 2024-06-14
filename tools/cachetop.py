@@ -33,6 +33,7 @@ FIELDS = (
     "PID",
     "UID",
     "PIDNS",
+    "MNTNS",
     "CMD",
     "HITS",
     "MISSES",
@@ -74,7 +75,7 @@ def get_processes_stats(
     counts = bpf.get_table("counts")
     stats = defaultdict(lambda: defaultdict(int))
     for k, v in counts.items():
-        stats["%d-%d-%d-%s" % (k.pid, k.uid, k.pidns, k.comm.decode('utf-8', 'replace'))][k.ip] = v.value
+        stats["%d-%d-%d-%d-%s" % (k.pid, k.uid, k.pidns, k.mntns, k.comm.decode('utf-8', 'replace'))][k.ip] = v.value
     stats_list = []
 
     for pid, count in sorted(stats.items(), key=lambda stat: stat[0]):
@@ -120,9 +121,9 @@ def get_processes_stats(
             if rtaccess != 0:
                 rhits = 100 * rtaccess
 
-        _pid, uid, pidns, comm = pid.split('-', 3)
+        _pid, uid, pidns, mntns, comm = pid.split('-', 4)
         stats_list.append(
-            (int(_pid), uid, pidns, comm,
+            (int(_pid), uid, pidns, mntns, comm,
              access, misses, mbd,
              rhits, whits))
 
@@ -148,11 +149,26 @@ def handle_loop(stdscr, args):
     #include <linux/ns_common.h>
     #include <linux/sched.h>
     #include <linux/pid_namespace.h>
+    #include <linux/mount.h>
+
+    /* see mountsnoop.py:
+    * XXX: struct mnt_namespace is defined in fs/mount.h, which is private
+    * to the VFS and not installed in any kernel-devel packages. So, let's
+    * duplicate the important part of the definition. There are actually
+    * more members in the real struct, but we don't need them, and they're
+    * more likely to change.
+    */
+    struct mnt_namespace {
+        atomic_t count;
+        struct ns_common ns;
+    };
+
     struct key_t {
         u64 ip;
         u32 pid;
         u32 uid;
         u64 pidns;
+        u64 mntns;
         char comm[16];
     };
 
@@ -170,6 +186,7 @@ def handle_loop(stdscr, args):
         key.pid = pid & 0xFFFFFFFF;
         key.uid = uid & 0xFFFFFFFF;
         key.pidns = task->nsproxy->pid_ns_for_children->ns.inum;
+        key.mntns = task->nsproxy->mnt_ns->ns.inum;
         bpf_get_current_comm(&(key.comm), 16);
 
         counts.increment(key);
@@ -224,7 +241,7 @@ def handle_loop(stdscr, args):
         # header
         stdscr.addstr(
             1, 0,
-            "{0:8} {1:8} {2:16} {3:16} {4:8} {5:8} {6:8} {7:10} {8:10}".format(
+            "{0:8} {1:8} {2:16} {3:16} {4:16} {5:8} {6:8} {7:8} {8:10} {9:10}".format(
                 *FIELDS
             ),
             curses.A_REVERSE
@@ -242,8 +259,8 @@ def handle_loop(stdscr, args):
 
             stdscr.addstr(
                 i + 2, 0,
-                "{0:8} {username:8.8} {2:16} {3:16} {4:8} {5:8} "
-                "{6:8} {7:9.1f}% {8:9.1f}%".format(
+                "{0:8} {username:8.8} {2:16} {3:16} {4:16} {5:8} {6:8} "
+                "{7:8} {8:9.1f}% {9:9.1f}%".format(
                     *stat, username=username
                 )
             )
