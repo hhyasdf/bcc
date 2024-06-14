@@ -35,11 +35,7 @@ FIELDS = (
     "PIDNS",
     "MNTNS",
     "CMD",
-    "HITS",
-    "MISSES",
-    "DIRTIES",
-    "READ_HIT%",
-    "WRITE_HIT%"
+    "DIRTIES"
 )
 #DEFAULT_FIELD = "HITS"
 DEFAULT_FIELD = "DIRTIES"
@@ -79,53 +75,15 @@ def get_processes_stats(
     stats_list = []
 
     for pid, count in sorted(stats.items(), key=lambda stat: stat[0]):
-        rtaccess = 0
-        wtaccess = 0
-        mpa = 0
         mbd = 0
-        apcl = 0
-        apd = 0
-        access = 0
-        misses = 0
-        rhits = 0
-        whits = 0
 
         for k, v in count.items():
-            if re.match(b'mark_page_accessed', bpf.ksym(k)) is not None:
-                mpa = max(0, v)
-
             if re.match(b'mark_buffer_dirty', bpf.ksym(k)) is not None:
                 mbd = max(0, v)
 
-            if re.match(b'add_to_page_cache_lru', bpf.ksym(k)) is not None:
-                apcl = max(0, v)
-
-            if re.match(b'account_page_dirtied', bpf.ksym(k)) is not None:
-                apd = max(0, v)
-
-            # access = total cache access incl. reads(mpa) and writes(mbd)
-            # misses = total of add to lru which we do when we write(mbd)
-            # and also the mark the page dirty(same as mbd)
-            access = (mpa + mbd)
-            misses = (apcl + apd)
-
-            # rtaccess is the read hit % during the sample period.
-            # wtaccess is the write hit % during the sample period.
-            if mpa > 0:
-                rtaccess = float(mpa) / (access + misses)
-            if apcl > 0:
-                wtaccess = float(apcl) / (access + misses)
-
-            if wtaccess != 0:
-                whits = 100 * wtaccess
-            if rtaccess != 0:
-                rhits = 100 * rtaccess
-
         _pid, uid, pidns, mntns, comm = pid.split('-', 4)
         stats_list.append(
-            (int(_pid), uid, pidns, mntns, comm,
-             access, misses, mbd,
-             rhits, whits))
+            (int(_pid), uid, pidns, mntns, comm, mbd))
 
     stats_list = sorted(
         stats_list, key=lambda stat: stat[sort_field], reverse=sort_reverse
@@ -150,6 +108,12 @@ def handle_loop(stdscr, args):
     #include <linux/sched.h>
     #include <linux/pid_namespace.h>
     #include <linux/mount.h>
+    #include <linux/buffer_head.h>
+    #include <linux/blk_types.h>
+    #include <linux/fs.h>
+    #include <linux/dcache.h>
+    #include <linux/list.h>
+    #include <linux/kdev_t.h>
 
     /* see mountsnoop.py:
     * XXX: struct mnt_namespace is defined in fs/mount.h, which is private
@@ -179,7 +143,12 @@ def handle_loop(stdscr, args):
         u64 pid = bpf_get_current_pid_tgid();
         u32 uid = bpf_get_current_uid_gid();
 
+        struct buffer_head *bh = (struct buffer_head *)PT_REGS_PARM1(ctx);
+        struct block_device *b_bdev = bh->b_bdev;
+        u32 dev = b_bdev->bd_dev;
+
         struct task_struct *task;
+
         task = (struct task_struct *)bpf_get_current_task();
 
         key.ip = PT_REGS_IP(ctx);
@@ -189,15 +158,19 @@ def handle_loop(stdscr, args):
         key.mntns = task->nsproxy->mnt_ns->ns.inum;
         bpf_get_current_comm(&(key.comm), 16);
 
-        counts.increment(key);
+        if(MAJOR(dev) == TARGET_DEV_MAJOR_NUM && MINOR(dev) == TARGET_DEV_MINOR_NUM){
+            counts.increment(key);
+        }
         return 0;
     }
 
     """
+
+    major_num, minor_num = args.dev_num.split(':', 2)
+    bpf_text = bpf_text.replace('TARGET_DEV_MAJOR_NUM', major_num)
+    bpf_text = bpf_text.replace('TARGET_DEV_MINOR_NUM', minor_num)
+
     b = BPF(text=bpf_text)
-    b.attach_kprobe(event="add_to_page_cache_lru", fn_name="do_count")
-    b.attach_kprobe(event="mark_page_accessed", fn_name="do_count")
-    b.attach_kprobe(event="account_page_dirtied", fn_name="do_count")
     b.attach_kprobe(event="mark_buffer_dirty", fn_name="do_count")
 
     exiting = 0
@@ -241,7 +214,7 @@ def handle_loop(stdscr, args):
         # header
         stdscr.addstr(
             1, 0,
-            "{0:8} {1:8} {2:16} {3:16} {4:16} {5:8} {6:8} {7:8} {8:10} {9:10}".format(
+            "{0:8} {1:8} {2:16} {3:16} {4:16} {5:8}".format(
                 *FIELDS
             ),
             curses.A_REVERSE
@@ -259,8 +232,7 @@ def handle_loop(stdscr, args):
 
             stdscr.addstr(
                 i + 2, 0,
-                "{0:8} {username:8.8} {2:16} {3:16} {4:16} {5:8} {6:8} "
-                "{7:8} {8:9.1f}% {9:9.1f}%".format(
+                "{0:8} {username:8.8} {2:16} {3:16} {4:16} {5:8} ".format(
                     *stat, username=username
                 )
             )
@@ -277,8 +249,12 @@ def parse_arguments():
         description='show Linux page cache hit/miss statistics including read '
                     'and write hit % per processes in a UI like top.'
     )
+
+    parser.add_argument('dev_num', type=str, default=8, 
+                        help='The device number of the storage device.')
+    
     parser.add_argument(
-        'interval', type=int, default=5, nargs='?',
+        'interval', type=int, default=5, nargs='?', 
         help='Interval between probes.'
     )
 
