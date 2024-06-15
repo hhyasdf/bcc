@@ -78,7 +78,7 @@ def get_processes_stats(
         mbd = 0
 
         for k, v in count.items():
-            if re.match(b'mark_buffer_dirty', bpf.ksym(k)) is not None:
+            if re.match(b'__set_page_dirty', bpf.ksym(k)) is not None:
                 mbd = max(0, v)
 
         _pid, uid, pidns, mntns, comm = pid.split('-', 4)
@@ -108,12 +108,7 @@ def handle_loop(stdscr, args):
     #include <linux/sched.h>
     #include <linux/pid_namespace.h>
     #include <linux/mount.h>
-    #include <linux/buffer_head.h>
-    #include <linux/blk_types.h>
     #include <linux/fs.h>
-    #include <linux/dcache.h>
-    #include <linux/list.h>
-    #include <linux/kdev_t.h>
 
     /* see mountsnoop.py:
     * XXX: struct mnt_namespace is defined in fs/mount.h, which is private
@@ -143,9 +138,10 @@ def handle_loop(stdscr, args):
         u64 pid = bpf_get_current_pid_tgid();
         u32 uid = bpf_get_current_uid_gid();
 
-        struct buffer_head *bh = (struct buffer_head *)PT_REGS_PARM1(ctx);
-        struct block_device *b_bdev = bh->b_bdev;
-        u32 dev = b_bdev->bd_dev;
+        struct address_space *addr_space = (struct address_space *)PT_REGS_PARM2(ctx);
+        struct inode *f_inode = addr_space->host;
+        struct super_block *f_sb = f_inode->i_sb;
+        u32 dev = f_sb->s_dev;
 
         struct task_struct *task;
 
@@ -158,7 +154,7 @@ def handle_loop(stdscr, args):
         key.mntns = task->nsproxy->mnt_ns->ns.inum;
         bpf_get_current_comm(&(key.comm), 16);
 
-        if(MAJOR(dev) == TARGET_DEV_MAJOR_NUM && MINOR(dev) == TARGET_DEV_MINOR_NUM){
+        if(dev == MKDEV(TARGET_DEV_MAJOR_NUM, TARGET_DEV_MINOR_NUM)){
             counts.increment(key);
         }
         return 0;
@@ -171,7 +167,7 @@ def handle_loop(stdscr, args):
     bpf_text = bpf_text.replace('TARGET_DEV_MINOR_NUM', minor_num)
 
     b = BPF(text=bpf_text)
-    b.attach_kprobe(event="mark_buffer_dirty", fn_name="do_count")
+    b.attach_kprobe(event="__set_page_dirty", fn_name="do_count")
 
     exiting = 0
 
